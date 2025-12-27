@@ -2,7 +2,7 @@ import { z } from 'zod';
 import { createMcpHandler } from 'mcp-handler';
 
 const LTA_API_KEY = process.env.LTA_DATAMALL_KEY || '';
-const LTA_API_BASE = 'http://datamall2.mytransport.sg/ltaodataservice';
+const LTA_API_BASE = 'https://datamall2.mytransport.sg/ltaodataservice';
 
 // Helper function to make LTA API requests
 async function makeLtaRequest(endpoint: string, params: Record<string, string> = {}) {

@@ -1,7 +1,7 @@
 import { NextRequest } from 'next/server';
 
 const LTA_API_KEY = process.env.LTA_DATAMALL_KEY || '';
-const LTA_API_BASE = 'http://datamall2.mytransport.sg/ltaodataservice';
+const LTA_API_BASE = 'https://datamall2.mytransport.sg/ltaodataservice';
 
 // Helper function to make LTA API requests
 async function makeLtaRequest(endpoint: string, params: Record<string, string> = {}) {
@@ -221,14 +221,8 @@ async function handleToolCall(name: string, args: any): Promise<string> {
   }
 }
 
-// Session storage for SSE connections
-const sessions = new Map<string, {
-  controller: ReadableStreamDefaultController;
-  encoder: TextEncoder;
-}>();
-
 // Handle MCP JSON-RPC messages
-async function handleMessage(message: any, sessionId: string): Promise<any> {
+async function handleMessage(message: any): Promise<any> {
   const { method, id, params } = message;
 
   switch (method) {
@@ -285,38 +279,37 @@ async function handleMessage(message: any, sessionId: string): Promise<any> {
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+export const maxDuration = 60;
 
+// GET - Establish SSE connection
 export async function GET(request: NextRequest) {
-  const sessionId = crypto.randomUUID();
+  const encoder = new TextEncoder();
   
   const stream = new ReadableStream({
     start(controller) {
-      const encoder = new TextEncoder();
+      // Send the endpoint URL for POSTing messages back
+      // For Vercel serverless, we handle POST on the same endpoint
+      const baseUrl = request.url.split('?')[0];
+      controller.enqueue(encoder.encode(`event: endpoint\ndata: ${baseUrl}\n\n`));
       
-      // Store session
-      sessions.set(sessionId, { controller, encoder });
+      // Send initial heartbeat
+      controller.enqueue(encoder.encode(`: heartbeat\n\n`));
       
-      // Send endpoint event (tells client where to POST messages)
-      const endpointUrl = new URL(request.url);
-      endpointUrl.pathname = '/api/sse';
-      endpointUrl.searchParams.set('sessionId', sessionId);
-      
-      controller.enqueue(encoder.encode(`event: endpoint\ndata: ${endpointUrl.toString()}\n\n`));
-      
-      // Send heartbeat every 30 seconds
+      // Keep connection alive with heartbeats
       const heartbeat = setInterval(() => {
         try {
           controller.enqueue(encoder.encode(`: heartbeat\n\n`));
         } catch {
           clearInterval(heartbeat);
-          sessions.delete(sessionId);
         }
-      }, 30000);
+      }, 15000);
       
-      // Cleanup on close
+      // Cleanup on abort
       request.signal.addEventListener('abort', () => {
         clearInterval(heartbeat);
-        sessions.delete(sessionId);
+        try {
+          controller.close();
+        } catch {}
       });
     }
   });
@@ -334,40 +327,21 @@ export async function GET(request: NextRequest) {
   });
 }
 
+// POST - Handle MCP messages and return response directly
 export async function POST(request: NextRequest) {
-  const url = new URL(request.url);
-  const sessionId = url.searchParams.get('sessionId');
-
-  if (!sessionId) {
-    return new Response(JSON.stringify({ error: 'Missing sessionId' }), {
-      status: 400,
-      headers: { 
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-      },
-    });
-  }
-
-  const session = sessions.get(sessionId);
-  if (!session) {
-    return new Response(JSON.stringify({ error: 'Session not found' }), {
-      status: 404,
-      headers: { 
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*',
-      },
-    });
-  }
-
   try {
     const message = await request.json();
-    const response = await handleMessage(message, sessionId);
+    const response = await handleMessage(message);
     
+    // Return the response directly as JSON
+    // The client will receive this as the POST response
     if (response) {
-      // Send response via SSE
-      session.controller.enqueue(
-        session.encoder.encode(`event: message\ndata: ${JSON.stringify(response)}\n\n`)
-      );
+      return new Response(JSON.stringify(response), {
+        headers: { 
+          'Content-Type': 'application/json',
+          'Access-Control-Allow-Origin': '*',
+        },
+      });
     }
 
     return new Response(JSON.stringify({ success: true }), {
@@ -377,8 +351,16 @@ export async function POST(request: NextRequest) {
       },
     });
   } catch (error) {
-    return new Response(JSON.stringify({ error: 'Failed to process message' }), {
-      status: 500,
+    console.error('Error processing message:', error);
+    return new Response(JSON.stringify({ 
+      jsonrpc: '2.0',
+      error: { 
+        code: -32000, 
+        message: error instanceof Error ? error.message : 'Failed to process message' 
+      },
+      id: null
+    }), {
+      status: 200, // MCP expects 200 even for errors
       headers: { 
         'Content-Type': 'application/json',
         'Access-Control-Allow-Origin': '*',
