@@ -336,10 +336,7 @@ const handler = createMcpHandler(
       },
     );
   },
-  {
-    name: 'sg-bus-mcp',
-    version: '1.0.0',
-  },
+  {},
   { 
     basePath: '/api',
     verboseLogs: true,
