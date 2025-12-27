@@ -1,33 +1,11 @@
 import { NextRequest } from 'next/server';
 
-const LTA_API_KEY = process.env.LTA_DATAMALL_KEY || '';
-const LTA_API_BASE = 'https://datamall2.mytransport.sg/ltaodataservice';
-
-// Helper function to make LTA API requests
-async function makeLtaRequest(endpoint: string, params: Record<string, string> = {}) {
-  const url = new URL(`${LTA_API_BASE}/${endpoint}`);
-  Object.entries(params).forEach(([key, value]) => {
-    if (value) url.searchParams.append(key, value);
-  });
-
-  const response = await fetch(url.toString(), {
-    headers: {
-      'AccountKey': LTA_API_KEY,
-      'Accept': 'application/json',
-    },
-  });
-
-  if (!response.ok) {
-    throw new Error(`LTA API error: ${response.status} ${response.statusText}`);
-  }
-
-  return response.json();
-}
+const ARRIVELAH_API = 'https://arrivelah2.busrouter.sg';
 
 // Helper functions
-function getMinutesUntilArrival(estimatedArrival: string): string {
-  if (!estimatedArrival) return 'N/A';
-  const arrivalTime = new Date(estimatedArrival);
+function getMinutesUntilArrival(timeString: string): string {
+  if (!timeString) return 'N/A';
+  const arrivalTime = new Date(timeString);
   const now = new Date();
   const diffMs = arrivalTime.getTime() - now.getTime();
   const diffMins = Math.round(diffMs / 60000);
@@ -38,122 +16,146 @@ function getMinutesUntilArrival(estimatedArrival: string): string {
 
 function formatLoad(load: string): string {
   const loadMap: Record<string, string> = { 'SEA': 'Seats Available', 'SDA': 'Standing Available', 'LSD': 'Limited Standing' };
-  return loadMap[load] || load;
+  return loadMap[load] || load || 'Unknown';
 }
 
 function formatBusType(type: string): string {
   const typeMap: Record<string, string> = { 'SD': 'Single Deck', 'DD': 'Double Deck', 'BD': 'Bendy' };
-  return typeMap[type] || type;
+  return typeMap[type] || type || 'Unknown';
 }
 
 function formatOperator(operator: string): string {
-  const operatorMap: Record<string, string> = { 'SBST': 'SBS Transit', 'SMRT': 'SMRT Corporation', 'TTS': 'Tower Transit Singapore', 'GAS': 'Go Ahead Singapore' };
-  return operatorMap[operator] || operator;
+  const operatorMap: Record<string, string> = { 'SBST': 'SBS Transit', 'SMRT': 'SMRT Corporation', 'TTS': 'Tower Transit', 'GAS': 'Go Ahead' };
+  return operatorMap[operator] || operator || 'Unknown';
+}
+
+// Bus stop data (cached from arrivelah)
+let busStopsCache: any[] | null = null;
+let busStopsCacheTime = 0;
+const CACHE_DURATION = 24 * 60 * 60 * 1000; // 24 hours
+
+async function getBusStops(): Promise<any[]> {
+  const now = Date.now();
+  if (busStopsCache && (now - busStopsCacheTime) < CACHE_DURATION) {
+    return busStopsCache;
+  }
+  
+  try {
+    const response = await fetch('https://raw.githubusercontent.com/cheeaun/busrouter-sg/master/data/3/stops.json');
+    if (response.ok) {
+      const data = await response.json();
+      // Convert object to array format
+      busStopsCache = Object.entries(data).map(([code, stop]: [string, any]) => ({
+        BusStopCode: code,
+        Description: stop[2] || '',
+        RoadName: stop[3] || '',
+        Latitude: stop[0],
+        Longitude: stop[1]
+      }));
+      busStopsCacheTime = now;
+      return busStopsCache;
+    }
+  } catch (error) {
+    console.error('Failed to fetch bus stops:', error);
+  }
+  return busStopsCache || [];
 }
 
 // Tool implementations
 async function getBusArrivals(busStopCode: string, serviceNo?: string) {
-  const params: Record<string, string> = { BusStopCode: busStopCode };
-  if (serviceNo) params.ServiceNo = serviceNo;
-  const data = await makeLtaRequest('BusArrivalv2', params);
+  try {
+    const response = await fetch(`${ARRIVELAH_API}/?id=${busStopCode}`);
+    if (!response.ok) {
+      throw new Error(`API error: ${response.status}`);
+    }
+    
+    const data = await response.json();
+    
+    if (!data.services || data.services.length === 0) {
+      return `No bus services found at bus stop ${busStopCode}. Please check if the bus stop code is correct.`;
+    }
 
-  if (!data.Services || data.Services.length === 0) {
-    return `No bus services found at bus stop ${busStopCode}. Please check if the bus stop code is correct.`;
-  }
+    let services = data.services;
+    if (serviceNo) {
+      services = services.filter((s: any) => s.no === serviceNo);
+      if (services.length === 0) {
+        return `Bus service ${serviceNo} not found at stop ${busStopCode}.`;
+      }
+    }
 
-  let result = `🚌 Bus Arrivals at Stop ${busStopCode}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
-  for (const service of data.Services) {
-    result += `📍 Service ${service.ServiceNo} (${formatOperator(service.Operator)})\n`;
-    if (service.NextBus?.EstimatedArrival) {
-      result += `   1st: ${getMinutesUntilArrival(service.NextBus.EstimatedArrival)} | ${formatLoad(service.NextBus.Load)} | ${formatBusType(service.NextBus.Type)}\n`;
+    let result = `🚌 Bus Arrivals at Stop ${busStopCode}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+    
+    for (const service of services) {
+      result += `📍 Service ${service.no} (${formatOperator(service.operator)})\n`;
+      
+      if (service.next?.time) {
+        result += `   1st: ${getMinutesUntilArrival(service.next.time)} | ${formatLoad(service.next.load)} | ${formatBusType(service.next.type)}\n`;
+      }
+      if (service.next2?.time) {
+        result += `   2nd: ${getMinutesUntilArrival(service.next2.time)} | ${formatLoad(service.next2.load)}\n`;
+      }
+      if (service.next3?.time) {
+        result += `   3rd: ${getMinutesUntilArrival(service.next3.time)} | ${formatLoad(service.next3.load)}\n`;
+      }
+      result += '\n';
     }
-    if (service.NextBus2?.EstimatedArrival) {
-      result += `   2nd: ${getMinutesUntilArrival(service.NextBus2.EstimatedArrival)} | ${formatLoad(service.NextBus2.Load)}\n`;
-    }
-    if (service.NextBus3?.EstimatedArrival) {
-      result += `   3rd: ${getMinutesUntilArrival(service.NextBus3.EstimatedArrival)} | ${formatLoad(service.NextBus3.Load)}\n`;
-    }
-    result += '\n';
+    
+    return result;
+  } catch (error) {
+    return `Error fetching bus arrivals: ${error instanceof Error ? error.message : 'Unknown error'}`;
   }
-  return result;
 }
 
 async function searchBusStops(query: string) {
-  let allStops: any[] = [];
-  let skip = 0;
-  while (skip < 6000) {
-    const data = await makeLtaRequest('BusStops', { '$skip': skip.toString() });
-    if (!data.value || data.value.length === 0) break;
-    allStops = allStops.concat(data.value);
-    skip += 500;
-  }
+  try {
+    const stops = await getBusStops();
+    const searchLower = query.toLowerCase();
+    
+    const matchingStops = stops.filter(stop =>
+      stop.Description?.toLowerCase().includes(searchLower) ||
+      stop.RoadName?.toLowerCase().includes(searchLower) ||
+      stop.BusStopCode?.includes(query)
+    );
 
-  const searchLower = query.toLowerCase();
-  const matchingStops = allStops.filter(stop =>
-    stop.Description?.toLowerCase().includes(searchLower) ||
-    stop.RoadName?.toLowerCase().includes(searchLower)
-  );
+    if (matchingStops.length === 0) {
+      return `No bus stops found matching "${query}". Try a different search term.`;
+    }
 
-  if (matchingStops.length === 0) {
-    return `No bus stops found matching "${query}". Try a different search term.`;
+    const limitedStops = matchingStops.slice(0, 15);
+    let result = `🔍 Bus Stops matching "${query}"\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nFound ${matchingStops.length} stops (showing first ${limitedStops.length})\n\n`;
+    
+    for (const stop of limitedStops) {
+      result += `📍 ${stop.Description}\n   Code: ${stop.BusStopCode}\n   Road: ${stop.RoadName}\n\n`;
+    }
+    
+    return result;
+  } catch (error) {
+    return `Error searching bus stops: ${error instanceof Error ? error.message : 'Unknown error'}`;
   }
-
-  const limitedStops = matchingStops.slice(0, 15);
-  let result = `🔍 Bus Stops matching "${query}"\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nFound ${matchingStops.length} stops (showing first ${limitedStops.length})\n\n`;
-  for (const stop of limitedStops) {
-    result += `📍 ${stop.Description}\n   Code: ${stop.BusStopCode}\n   Road: ${stop.RoadName}\n\n`;
-  }
-  return result;
 }
 
 async function getBusStopInfo(busStopCode: string) {
-  let allStops: any[] = [];
-  let skip = 0;
-  while (skip < 6000) {
-    const data = await makeLtaRequest('BusStops', { '$skip': skip.toString() });
-    if (!data.value || data.value.length === 0) break;
-    allStops = allStops.concat(data.value);
-    skip += 500;
+  try {
+    const stops = await getBusStops();
+    const busStop = stops.find(stop => stop.BusStopCode === busStopCode);
+    
+    if (!busStop) {
+      return `Bus stop ${busStopCode} not found. Please check if the code is correct.`;
+    }
+
+    // Get services at this stop
+    const arrivalResponse = await fetch(`${ARRIVELAH_API}/?id=${busStopCode}`);
+    let services = 'Unable to fetch services';
+    
+    if (arrivalResponse.ok) {
+      const arrivalData = await arrivalResponse.json();
+      services = arrivalData.services?.map((s: any) => s.no).join(', ') || 'No services available';
+    }
+
+    return `📍 Bus Stop Information\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nName: ${busStop.Description}\nCode: ${busStop.BusStopCode}\nRoad: ${busStop.RoadName}\nLocation: ${busStop.Latitude}, ${busStop.Longitude}\n\n🚌 Bus Services: ${services}`;
+  } catch (error) {
+    return `Error fetching bus stop info: ${error instanceof Error ? error.message : 'Unknown error'}`;
   }
-
-  const busStop = allStops.find(stop => stop.BusStopCode === busStopCode);
-  if (!busStop) {
-    return `Bus stop ${busStopCode} not found. Please check if the code is correct.`;
-  }
-
-  const arrivalData = await makeLtaRequest('BusArrivalv2', { BusStopCode: busStopCode });
-  const services = arrivalData.Services?.map((s: any) => s.ServiceNo).join(', ') || 'No services available';
-
-  return `📍 Bus Stop Information\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nName: ${busStop.Description}\nCode: ${busStop.BusStopCode}\nRoad: ${busStop.RoadName}\nLocation: ${busStop.Latitude}, ${busStop.Longitude}\n\n🚌 Bus Services: ${services}`;
-}
-
-async function getBusRoutes(serviceNo: string) {
-  let allRoutes: any[] = [];
-  let skip = 0;
-  while (skip < 5000) {
-    const data = await makeLtaRequest('BusRoutes', { '$skip': skip.toString() });
-    if (!data.value || data.value.length === 0) break;
-    const serviceRoutes = data.value.filter((route: any) => route.ServiceNo === serviceNo);
-    allRoutes = allRoutes.concat(serviceRoutes);
-    skip += 500;
-    if (allRoutes.length > 0 && serviceRoutes.length === 0) break;
-  }
-
-  if (allRoutes.length === 0) {
-    return `No route information found for bus service ${serviceNo}. Please check if the service number is correct.`;
-  }
-
-  const direction1 = allRoutes.filter(r => r.Direction === 1).sort((a, b) => a.StopSequence - b.StopSequence);
-  const direction2 = allRoutes.filter(r => r.Direction === 2).sort((a, b) => a.StopSequence - b.StopSequence);
-
-  let result = `🚌 Bus Service ${serviceNo} Route Information\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
-  if (direction1.length > 0) {
-    result += `📍 Direction 1 (${direction1.length} stops)\n   From: Stop ${direction1[0].BusStopCode}\n   To: Stop ${direction1[direction1.length - 1].BusStopCode}\n   First Bus (Weekday): ${direction1[0].WD_FirstBus || 'N/A'}\n   Last Bus (Weekday): ${direction1[0].WD_LastBus || 'N/A'}\n\n`;
-  }
-  if (direction2.length > 0) {
-    result += `📍 Direction 2 (${direction2.length} stops)\n   From: Stop ${direction2[0].BusStopCode}\n   To: Stop ${direction2[direction2.length - 1].BusStopCode}\n   First Bus (Weekday): ${direction2[0].WD_FirstBus || 'N/A'}\n   Last Bus (Weekday): ${direction2[0].WD_LastBus || 'N/A'}\n`;
-  }
-  return result;
 }
 
 // MCP Tools definition
@@ -191,17 +193,6 @@ const tools = [
       },
       required: ['bus_stop_code']
     }
-  },
-  {
-    name: 'get_bus_routes',
-    description: 'Get the full route information for a specific bus service, including all bus stops along the route.',
-    inputSchema: {
-      type: 'object',
-      properties: {
-        service_no: { type: 'string', description: 'The bus service number (e.g., "15", "77", "NR1")' }
-      },
-      required: ['service_no']
-    }
   }
 ];
 
@@ -214,8 +205,6 @@ async function handleToolCall(name: string, args: any): Promise<string> {
       return await searchBusStops(args.query);
     case 'get_bus_stop_info':
       return await getBusStopInfo(args.bus_stop_code);
-    case 'get_bus_routes':
-      return await getBusRoutes(args.service_no);
     default:
       return `Unknown tool: ${name}`;
   }
@@ -238,7 +227,7 @@ async function handleMessage(message: any): Promise<any> {
       };
 
     case 'initialized':
-      return null; // No response needed
+      return null;
 
     case 'tools/list':
       return {
@@ -287,15 +276,10 @@ export async function GET(request: NextRequest) {
   
   const stream = new ReadableStream({
     start(controller) {
-      // Send the endpoint URL for POSTing messages back
-      // For Vercel serverless, we handle POST on the same endpoint
       const baseUrl = request.url.split('?')[0];
       controller.enqueue(encoder.encode(`event: endpoint\ndata: ${baseUrl}\n\n`));
-      
-      // Send initial heartbeat
       controller.enqueue(encoder.encode(`: heartbeat\n\n`));
       
-      // Keep connection alive with heartbeats
       const heartbeat = setInterval(() => {
         try {
           controller.enqueue(encoder.encode(`: heartbeat\n\n`));
@@ -304,12 +288,9 @@ export async function GET(request: NextRequest) {
         }
       }, 15000);
       
-      // Cleanup on abort
       request.signal.addEventListener('abort', () => {
         clearInterval(heartbeat);
-        try {
-          controller.close();
-        } catch {}
+        try { controller.close(); } catch {}
       });
     }
   });
@@ -327,14 +308,12 @@ export async function GET(request: NextRequest) {
   });
 }
 
-// POST - Handle MCP messages and return response directly
+// POST - Handle MCP messages
 export async function POST(request: NextRequest) {
   try {
     const message = await request.json();
     const response = await handleMessage(message);
     
-    // Return the response directly as JSON
-    // The client will receive this as the POST response
     if (response) {
       return new Response(JSON.stringify(response), {
         headers: { 
@@ -354,13 +333,10 @@ export async function POST(request: NextRequest) {
     console.error('Error processing message:', error);
     return new Response(JSON.stringify({ 
       jsonrpc: '2.0',
-      error: { 
-        code: -32000, 
-        message: error instanceof Error ? error.message : 'Failed to process message' 
-      },
+      error: { code: -32000, message: error instanceof Error ? error.message : 'Failed to process message' },
       id: null
     }), {
-      status: 200, // MCP expects 200 even for errors
+      status: 200,
       headers: { 
         'Content-Type': 'application/json',
         'Access-Control-Allow-Origin': '*',
