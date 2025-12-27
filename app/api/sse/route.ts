@@ -1,6 +1,7 @@
 import { NextRequest } from 'next/server';
 
-const ARRIVELAH_API = 'https://arrivelah2.busrouter.sg';
+const LTA_API_BASE = 'https://datamall2.mytransport.sg/ltaodataservice';
+const LTA_API_KEY = process.env.LTA_DATAMALL_KEY || '';
 
 // Helper functions
 function getMinutesUntilArrival(timeString: string): string {
@@ -29,10 +30,35 @@ function formatOperator(operator: string): string {
   return operatorMap[operator] || operator || 'Unknown';
 }
 
-// Bus stop data (cached from arrivelah)
+// Bus stop data cache
 let busStopsCache: any[] | null = null;
 let busStopsCacheTime = 0;
 const CACHE_DURATION = 24 * 60 * 60 * 1000; // 24 hours
+
+async function fetchAllBusStops(): Promise<any[]> {
+  const allStops: any[] = [];
+  let skip = 0;
+  
+  while (true) {
+    const response = await fetch(`${LTA_API_BASE}/BusStops?$skip=${skip}`, {
+      headers: { 'AccountKey': LTA_API_KEY }
+    });
+    
+    if (!response.ok) {
+      throw new Error(`LTA API error: ${response.status}`);
+    }
+    
+    const data = await response.json();
+    if (!data.value || data.value.length === 0) break;
+    
+    allStops.push(...data.value);
+    skip += 500;
+    
+    if (data.value.length < 500) break;
+  }
+  
+  return allStops;
+}
 
 async function getBusStops(): Promise<any[]> {
   const now = Date.now();
@@ -41,61 +67,50 @@ async function getBusStops(): Promise<any[]> {
   }
   
   try {
-    const response = await fetch('https://raw.githubusercontent.com/cheeaun/busrouter-sg/master/data/3/stops.json');
-    if (response.ok) {
-      const data = await response.json();
-      // Convert object to array format
-      busStopsCache = Object.entries(data).map(([code, stop]: [string, any]) => ({
-        BusStopCode: code,
-        Description: stop[2] || '',
-        RoadName: stop[3] || '',
-        Latitude: stop[0],
-        Longitude: stop[1]
-      }));
-      busStopsCacheTime = now;
-      return busStopsCache;
-    }
+    busStopsCache = await fetchAllBusStops();
+    busStopsCacheTime = now;
+    return busStopsCache;
   } catch (error) {
     console.error('Failed to fetch bus stops:', error);
+    return busStopsCache || [];
   }
-  return busStopsCache || [];
 }
 
 // Tool implementations
 async function getBusArrivals(busStopCode: string, serviceNo?: string) {
   try {
-    const response = await fetch(`${ARRIVELAH_API}/?id=${busStopCode}`);
+    let url = `${LTA_API_BASE}/v3/BusArrival?BusStopCode=${busStopCode}`;
+    if (serviceNo) {
+      url += `&ServiceNo=${serviceNo}`;
+    }
+    
+    const response = await fetch(url, {
+      headers: { 'AccountKey': LTA_API_KEY }
+    });
+    
     if (!response.ok) {
-      throw new Error(`API error: ${response.status}`);
+      throw new Error(`LTA API error: ${response.status} ${response.statusText}`);
     }
     
     const data = await response.json();
     
-    if (!data.services || data.services.length === 0) {
+    if (!data.Services || data.Services.length === 0) {
       return `No bus services found at bus stop ${busStopCode}. Please check if the bus stop code is correct.`;
-    }
-
-    let services = data.services;
-    if (serviceNo) {
-      services = services.filter((s: any) => s.no === serviceNo);
-      if (services.length === 0) {
-        return `Bus service ${serviceNo} not found at stop ${busStopCode}.`;
-      }
     }
 
     let result = `🚌 Bus Arrivals at Stop ${busStopCode}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
     
-    for (const service of services) {
-      result += `📍 Service ${service.no} (${formatOperator(service.operator)})\n`;
+    for (const service of data.Services) {
+      result += `📍 Service ${service.ServiceNo} (${formatOperator(service.Operator)})\n`;
       
-      if (service.next?.time) {
-        result += `   1st: ${getMinutesUntilArrival(service.next.time)} | ${formatLoad(service.next.load)} | ${formatBusType(service.next.type)}\n`;
+      if (service.NextBus?.EstimatedArrival) {
+        result += `   1st: ${getMinutesUntilArrival(service.NextBus.EstimatedArrival)} | ${formatLoad(service.NextBus.Load)} | ${formatBusType(service.NextBus.Type)}\n`;
       }
-      if (service.next2?.time) {
-        result += `   2nd: ${getMinutesUntilArrival(service.next2.time)} | ${formatLoad(service.next2.load)}\n`;
+      if (service.NextBus2?.EstimatedArrival) {
+        result += `   2nd: ${getMinutesUntilArrival(service.NextBus2.EstimatedArrival)} | ${formatLoad(service.NextBus2.Load)}\n`;
       }
-      if (service.next3?.time) {
-        result += `   3rd: ${getMinutesUntilArrival(service.next3.time)} | ${formatLoad(service.next3.load)}\n`;
+      if (service.NextBus3?.EstimatedArrival) {
+        result += `   3rd: ${getMinutesUntilArrival(service.NextBus3.EstimatedArrival)} | ${formatLoad(service.NextBus3.Load)}\n`;
       }
       result += '\n';
     }
@@ -144,17 +159,87 @@ async function getBusStopInfo(busStopCode: string) {
     }
 
     // Get services at this stop
-    const arrivalResponse = await fetch(`${ARRIVELAH_API}/?id=${busStopCode}`);
+    const arrivalResponse = await fetch(`${LTA_API_BASE}/v3/BusArrival?BusStopCode=${busStopCode}`, {
+      headers: { 'AccountKey': LTA_API_KEY }
+    });
+    
     let services = 'Unable to fetch services';
     
     if (arrivalResponse.ok) {
       const arrivalData = await arrivalResponse.json();
-      services = arrivalData.services?.map((s: any) => s.no).join(', ') || 'No services available';
+      services = arrivalData.Services?.map((s: any) => s.ServiceNo).join(', ') || 'No services available';
     }
 
     return `📍 Bus Stop Information\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nName: ${busStop.Description}\nCode: ${busStop.BusStopCode}\nRoad: ${busStop.RoadName}\nLocation: ${busStop.Latitude}, ${busStop.Longitude}\n\n🚌 Bus Services: ${services}`;
   } catch (error) {
     return `Error fetching bus stop info: ${error instanceof Error ? error.message : 'Unknown error'}`;
+  }
+}
+
+async function getBusRoutes(serviceNo: string) {
+  try {
+    // Fetch all routes and filter by service number
+    const allRoutes: any[] = [];
+    let skip = 0;
+    
+    while (true) {
+      const response = await fetch(`${LTA_API_BASE}/BusRoutes?$skip=${skip}`, {
+        headers: { 'AccountKey': LTA_API_KEY }
+      });
+      
+      if (!response.ok) {
+        throw new Error(`LTA API error: ${response.status}`);
+      }
+      
+      const data = await response.json();
+      if (!data.value || data.value.length === 0) break;
+      
+      allRoutes.push(...data.value.filter((r: any) => r.ServiceNo === serviceNo));
+      skip += 500;
+      
+      if (data.value.length < 500) break;
+    }
+    
+    if (allRoutes.length === 0) {
+      return `No routes found for bus service ${serviceNo}. Please check if the service number is correct.`;
+    }
+
+    // Group by direction
+    const direction1 = allRoutes.filter(r => r.Direction === 1).sort((a, b) => a.StopSequence - b.StopSequence);
+    const direction2 = allRoutes.filter(r => r.Direction === 2).sort((a, b) => a.StopSequence - b.StopSequence);
+    
+    // Get bus stop names
+    const stops = await getBusStops();
+    const stopMap = new Map(stops.map(s => [s.BusStopCode, s.Description]));
+    
+    let result = `🚌 Bus Route ${serviceNo}\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n`;
+    
+    if (direction1.length > 0) {
+      result += `📍 Direction 1 (${direction1.length} stops)\n`;
+      for (const stop of direction1.slice(0, 20)) {
+        const stopName = stopMap.get(stop.BusStopCode) || 'Unknown';
+        result += `   ${stop.StopSequence}. ${stopName} (${stop.BusStopCode})\n`;
+      }
+      if (direction1.length > 20) {
+        result += `   ... and ${direction1.length - 20} more stops\n`;
+      }
+      result += '\n';
+    }
+    
+    if (direction2.length > 0) {
+      result += `📍 Direction 2 (${direction2.length} stops)\n`;
+      for (const stop of direction2.slice(0, 20)) {
+        const stopName = stopMap.get(stop.BusStopCode) || 'Unknown';
+        result += `   ${stop.StopSequence}. ${stopName} (${stop.BusStopCode})\n`;
+      }
+      if (direction2.length > 20) {
+        result += `   ... and ${direction2.length - 20} more stops\n`;
+      }
+    }
+    
+    return result;
+  } catch (error) {
+    return `Error fetching bus routes: ${error instanceof Error ? error.message : 'Unknown error'}`;
   }
 }
 
@@ -193,6 +278,17 @@ const tools = [
       },
       required: ['bus_stop_code']
     }
+  },
+  {
+    name: 'get_bus_routes',
+    description: 'Get the full route information for a bus service, including all stops along the route.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        service_no: { type: 'string', description: 'The bus service number (e.g., "15", "77", "960")' }
+      },
+      required: ['service_no']
+    }
   }
 ];
 
@@ -205,6 +301,8 @@ async function handleToolCall(name: string, args: any): Promise<string> {
       return await searchBusStops(args.query);
     case 'get_bus_stop_info':
       return await getBusStopInfo(args.bus_stop_code);
+    case 'get_bus_routes':
+      return await getBusRoutes(args.service_no);
     default:
       return `Unknown tool: ${name}`;
   }
